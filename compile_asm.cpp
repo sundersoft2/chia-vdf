@@ -2,6 +2,8 @@
 
 #define COMPILE_ASM
 
+const bool enable_track_cycles=false;
+
 #include "headers.h"
 
 int main(int argc, char** argv) {

@@ -369,7 +369,7 @@ simd_integer from_integer(const integer& t, int size) {
     simd_integer res;
     res.memory.resize(size, 0);
 
-    mpz_export(&res.memory[0], nullptr, -1, 8, -1, carry_size, t.get_impl());
+    mpz_export(&res.memory[0], nullptr, -1, 8, -1, carry_size, t.impl);
 
     if (t<0) {
         res.fma(nullptr, res, {uint64(int64(-1))}, 0, true, false);
@@ -390,7 +390,7 @@ integer to_integer(simd_integer t, bool is_signed=true) {
     }
 
     integer res;
-    mpz_import(res.get_impl(), t.current_size(), -1, 8, -1, carry_size, &t.memory[0]);
+    mpz_import(res.impl, t.current_size(), -1, 8, -1, carry_size, &t.memory[0]);
 
     if (is_negative) {
         res=-res;

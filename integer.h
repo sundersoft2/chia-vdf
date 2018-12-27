@@ -34,97 +34,156 @@ struct generic_stats {
     }
 };
 
+struct track_cycles {
+    generic_stats& stats;
+    uint64 start_time;
+    bool is_aborted=false;
+
+    track_cycles(generic_stats& t_stats) : stats(t_stats) {
+        if (!enable_track_cycles) {
+            return;
+        }
+
+        start_time=__rdtsc();
+    }
+
+    void abort() {
+        if (!enable_track_cycles) {
+            return;
+        }
+
+        is_aborted=true;
+    }
+
+    ~track_cycles() {
+        if (!enable_track_cycles) {
+            return;
+        }
+
+        if (is_aborted) {
+            return;
+        }
+
+        uint64 end_time=__rdtsc();
+        uint64 delta=end_time-start_time;
+        int delta_int=delta;
+        if (delta_int==delta) {
+            stats.add(delta_int);
+        } else {
+            stats.add(INT_MAX);
+        }
+    }
+};
+
+struct track_max_type {
+    map<pair<int, string>, int> data;
+
+    void add(int line, string name, int value) {
+        auto& v=data[make_pair(line, name)];
+        v=max(v, value);
+    }
+
+    void output(int basis_bits) {
+        print( "== track max ==" );
+        for (auto c : data) {
+            print(c.first.second, double(c.second)/basis_bits);
+        }
+    }
+};
+track_max_type track_max;
+//#define TRACK_MAX(data) track_max.add(#data " {" __func__ ":" "__LINE__" ")", (data).num_bits())
+#define TRACK_MAX(data) track_max.add(__LINE__, #data, (data).num_bits())
+
 //typedef __mpz_struct mpz_t[1];
-//__mpz_struct does not have a pointer to itself
+typedef __mpz_struct mpz_struct;
+
+int mpz_num_bits_upper_bound(mpz_struct* v) {
+    return mpz_size(v)*sizeof(mp_limb_t);
+}
+
 struct integer {
-    __mpz_struct impl;
-
-    vector<__mpz_struct> cache;
-
-    const __mpz_struct* get_impl() const {
-        return &impl;
-    }
-
-    __mpz_struct* get_impl() {
-        return &impl;
-    }
-
-    void do_init() {
-        /*if (!cache.empty()) {
-            impl=cache.back();
-            cache.pop_back();
-        } else {*/
-            mpz_init(get_impl());
-        //}
-    }
+    mpz_struct impl[1];
 
     ~integer() {
-        //cache.push_back(impl);
-        mpz_clear(get_impl());
+        mpz_clear(impl);
     }
 
     integer() {
-        do_init();
-        mpz_set_si(get_impl(), 0);
+        mpz_init(impl);
     }
 
     integer(const integer& t) {
-        do_init();
-        mpz_set(get_impl(), t.get_impl());
+        mpz_init(impl);
+        mpz_set(impl, t.impl);
     }
 
     integer(integer&& t) {
-        do_init();
-        mpz_swap(get_impl(), t.get_impl());
+        mpz_init(impl);
+        mpz_swap(impl, t.impl);
     }
 
     explicit integer(int64 i) {
-        do_init();
-        mpz_set_si(get_impl(), i);
+        mpz_init(impl);
+        mpz_set_si(impl, i);
     }
 
     explicit integer(const string& s) {
-        do_init();
-        assert(mpz_set_str(get_impl(), s.c_str(), 0)==0);
+        mpz_init(impl);
+        assert(mpz_set_str(impl, s.c_str(), 0)==0);
     }
 
+    //lsb first
     explicit integer(const vector<uint64>& data) {
-        do_init();
-        mpz_import(get_impl(), data.size(), -1, 8, 0, 0, &data[0]);
+        mpz_init(impl);
+        mpz_import(impl, data.size(), -1, 8, 0, 0, &data[0]);
     }
 
+    //lsb first
     vector<uint64> to_vector() const {
         vector<uint64> res;
-        res.resize(mpz_sizeinbase(get_impl(), 2)/64 + 1, 0);
+        res.resize(mpz_sizeinbase(impl, 2)/64 + 1, 0);
 
         size_t count;
-        mpz_export(&res[0], &count, -1, 8, 0, 0, get_impl());
+        mpz_export(&res[0], &count, -1, 8, 0, 0, impl);
         res.resize(count);
 
         return res;
     }
 
     integer& operator=(const integer& t) {
-        mpz_set(get_impl(), t.get_impl());
+        mpz_set(impl, t.impl);
         return *this;
     }
 
     integer& operator=(integer&& t) {
-        mpz_swap(get_impl(), t.get_impl());
+        mpz_swap(impl, t.impl);
         return *this;
     }
 
     integer& operator=(int64 i) {
-        mpz_set_si(get_impl(), i);
+        mpz_set_si(impl, i);
         return *this;
     }
 
     integer& operator=(const string& s) {
-        assert(mpz_set_str(get_impl(), s.c_str(), 0)==0);
+        assert(mpz_set_str(impl, s.c_str(), 0)==0);
+        return *this;
+    }
+
+    void set_bit(int index, bool value) {
+        if (value) {
+            mpz_setbit(impl, index);
+        } else {
+            mpz_clrbit(impl, index);
+        }
+    }
+
+    bool get_bit(int index) {
+        return mpz_tstbit(impl, index);
     }
 
     USED string to_string() const {
-        char* res_char=mpz_get_str(nullptr, 16, get_impl());
+        char* res_char=mpz_get_str(nullptr, 16, impl);
         string res_string="0x";
         res_string+=res_char;
 
@@ -138,158 +197,159 @@ struct integer {
         return res_string;
     }
 
+    string to_string_dec() const {
+        char* res_char=mpz_get_str(nullptr, 10, impl);
+        string res_string=res_char;
+        free(res_char);
+        return res_string;
+    }
+
     integer& operator+=(const integer& t) {
-        mpz_add(get_impl(), get_impl(), t.get_impl());
+        mpz_add(impl, impl, t.impl);
         return *this;
     }
 
     integer operator+(const integer& t) const {
         integer res;
-        mpz_add(res.get_impl(), get_impl(), t.get_impl());
+        mpz_add(res.impl, impl, t.impl);
         return res;
     }
 
     integer& operator-=(const integer& t) {
-        mpz_sub(get_impl(), get_impl(), t.get_impl());
+        mpz_sub(impl, impl, t.impl);
         return *this;
     }
 
     integer operator-(const integer& t) const {
         integer res;
-        mpz_sub(res.get_impl(), get_impl(), t.get_impl());
+        mpz_sub(res.impl, impl, t.impl);
         return res;
     }
 
     integer& operator*=(const integer& t) {
-        mpz_mul(get_impl(), get_impl(), t.get_impl());
+        mpz_mul(impl, impl, t.impl);
         return *this;
     }
 
     integer operator*(const integer& t) const {
         integer res;
-        //uint64 start_time=__rdtsc();
-        mpz_mul(res.get_impl(), get_impl(), t.get_impl());
-        //uint64 end_time=__rdtsc();
-        //if (num_bits()>=100 && t.num_bits()>=100) print(end_time-start_time, num_bits(), t.num_bits());
+        mpz_mul(res.impl, impl, t.impl);
         return res;
     }
 
     integer& operator<<=(int i) {
         assert(i>=0);
-        mpz_mul_2exp(get_impl(), get_impl(), i);
+        mpz_mul_2exp(impl, impl, i);
         return *this;
     }
 
     integer operator<<(int i) const {
         assert(i>=0);
         integer res;
-        mpz_mul_2exp(res.get_impl(), get_impl(), i);
+        mpz_mul_2exp(res.impl, impl, i);
         return res;
     }
 
     integer operator-() const {
         integer res;
-        mpz_neg(res.get_impl(), get_impl());
+        mpz_neg(res.impl, impl);
         return res;
     }
 
     integer& operator/=(const integer& t) {
-        mpz_fdiv_q(get_impl(), get_impl(), t.get_impl());
+        mpz_fdiv_q(impl, impl, t.impl);
         return *this;
     }
 
     integer operator/(const integer& t) const {
         integer res;
-        //uint64 start_time=__rdtsc();
-        mpz_fdiv_q(res.get_impl(), get_impl(), t.get_impl());
-        //uint64 end_time=__rdtsc();
-        //if (num_bits()>=100 && t.num_bits()>=100 && num_bits()-t.num_bits()>=100) print(end_time-start_time, num_bits(), t.num_bits());
+        mpz_fdiv_q(res.impl, impl, t.impl);
         return res;
     }
 
     integer& operator>>=(int i) {
         assert(i>=0);
-        mpz_fdiv_q_2exp(get_impl(), get_impl(), i);
+        mpz_fdiv_q_2exp(impl, impl, i);
         return *this;
     }
 
     integer operator>>(int i) const {
         assert(i>=0);
         integer res;
-        mpz_fdiv_q_2exp(res.get_impl(), get_impl(), i);
+        mpz_fdiv_q_2exp(res.impl, impl, i);
         return res;
     }
     integer& operator%=(const integer& t) {
-        mpz_mod(get_impl(), get_impl(), t.get_impl());
+        mpz_mod(impl, impl, t.impl);
         return *this;
     }
 
     integer operator%(const integer& t) const {
         integer res;
-        mpz_mod(res.get_impl(), get_impl(), t.get_impl());
+        mpz_mod(res.impl, impl, t.impl);
         return res;
     }
 
     bool prime() const {
-        return mpz_probab_prime_p(get_impl(), 50)!=0;
+        return mpz_probab_prime_p(impl, 50)!=0;
     }
 
     bool operator<(const integer& t) const {
-        return mpz_cmp(get_impl(), t.get_impl())<0;
+        return mpz_cmp(impl, t.impl)<0;
     }
 
     bool operator<=(const integer& t) const {
-        return mpz_cmp(get_impl(), t.get_impl())<=0;
+        return mpz_cmp(impl, t.impl)<=0;
     }
 
     bool operator==(const integer& t) const {
-        return mpz_cmp(get_impl(), t.get_impl())==0;
+        return mpz_cmp(impl, t.impl)==0;
     }
 
     bool operator>=(const integer& t) const {
-        return mpz_cmp(get_impl(), t.get_impl())>=0;
+        return mpz_cmp(impl, t.impl)>=0;
     }
 
     bool operator>(const integer& t) const {
-        return mpz_cmp(get_impl(), t.get_impl())>0;
+        return mpz_cmp(impl, t.impl)>0;
     }
 
     bool operator!=(const integer& t) const {
-        return mpz_cmp(get_impl(), t.get_impl())!=0;
+        return mpz_cmp(impl, t.impl)!=0;
     }
 
     bool operator<(int i) const {
-        return mpz_cmp_si(get_impl(), i)<0;
+        return mpz_cmp_si(impl, i)<0;
     }
 
     bool operator<=(int i) const {
-        return mpz_cmp_si(get_impl(), i)<=0;
+        return mpz_cmp_si(impl, i)<=0;
     }
 
     bool operator==(int i) const {
-        return mpz_cmp_si(get_impl(), i)==0;
+        return mpz_cmp_si(impl, i)==0;
     }
 
     bool operator>=(int i) const {
-        return mpz_cmp_si(get_impl(), i)>=0;
+        return mpz_cmp_si(impl, i)>=0;
     }
 
     bool operator>(int i) const {
-        return mpz_cmp_si(get_impl(), i)>0;
+        return mpz_cmp_si(impl, i)>0;
     }
 
     bool operator!=(int i) const {
-        return mpz_cmp_si(get_impl(), i)!=0;
+        return mpz_cmp_si(impl, i)!=0;
     }
 
     int num_bits() const {
-        return mpz_sizeinbase(get_impl(), 2);
+        return mpz_sizeinbase(impl, 2);
     }
 };
 
 integer abs(const integer& t) {
     integer res;
-    mpz_neg(res.get_impl(), t.get_impl());
+    mpz_abs(res.impl, t.impl);
     return res;
 }
 
@@ -306,18 +366,12 @@ struct gcd_res {
 gcd_res gcd(const integer& a, const integer& b) {
     gcd_res res;
 
-    /*uint64 start_time=__rdtsc();
-    mpz_gcdext(res.gcd.get_impl(), res.s.get_impl(), nullptr, a.get_impl(), b.get_impl());
-    uint64 end_time=__rdtsc();*/
-
-    mpz_gcdext(res.gcd.get_impl(), res.s.get_impl(), res.t.get_impl(), a.get_impl(), b.get_impl());
-
-    //print( "gmp gcd:", end_time-start_time );
+    mpz_gcdext(res.gcd.impl, res.s.impl, res.t.impl, a.impl, b.impl);
 
     return res;
 }
 
-integer rand_integer(int num_bits) {
+integer rand_integer(int num_bits, int seed=-1) {
     static gmp_randstate_t state;
     static bool is_init=false;
 
@@ -327,8 +381,12 @@ integer rand_integer(int num_bits) {
         is_init=true;
     }
 
+    if (seed!=-1) {
+        gmp_randseed_ui(state, seed);
+    }
+
     integer res;
     assert(num_bits>=0);
-    mpz_urandomb(res.get_impl(), state, num_bits);
+    mpz_urandomb(res.impl, state, num_bits);
     return res;
 }

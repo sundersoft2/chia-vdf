@@ -148,6 +148,7 @@ void divide_integers_impl(
     string jump_table_exit=m.alloc_label();
 
     APPEND_M(str( ".section .rodata" ));
+    APPEND_M(str( ".balign 8" ));
     APPEND_M(str( "#:", jump_table ));
     vector<string> divisor_size_labels;
     for (int divisor_size_static=0;divisor_size_static<=b.size;++divisor_size_static) {

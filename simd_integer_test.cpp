@@ -9,8 +9,6 @@
 
 #include "vdf_new.h"
 
-todo //benchmarks: heat up the divide table in the data cache before each call. use different inputs on each call
-
 int main(int argc, char** argv) {
     using namespace simd_integer_namespace;
 

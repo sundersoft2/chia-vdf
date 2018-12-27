@@ -1,416 +1,507 @@
-/**
-Copyright 2018 Chia Network Inc
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-   http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-***/
-
 #include "include.h"
 
+//used for the final submission and correctness testing. correctness testing defines the VDF_ASSERT_ON_ROLLBACK environment variable
+#define VDF_MODE 0
+
+//used for performance or other testing
+//#define VDF_MODE 1
+
+//
+//
+
+#if VDF_MODE==0
+    const bool enable_track_cycles=false;
+    const bool test_correctness=false;
+    bool assert_on_rollback=false;
+    const bool debug_rollback=false;
+    const int asm_inject_random_errors_rate=0;
+    const int repeated_square_checkpoint_interval=1<<17; //should be a power of 2
+#endif
+
+#if VDF_MODE==1
+    const bool enable_track_cycles=true;
+    const int test_correctness=true;
+    bool assert_on_rollback=true;
+    const bool debug_rollback=false;
+    const int asm_inject_random_errors_rate=0;
+    const int repeated_square_checkpoint_interval=1<<17;
+#endif
+
+const int reduce_max_iterations=10000;
+
 #include "headers.h"
+#include "vdf_original.h"
+
+#include "vdf_new.h"
 
 using namespace std;
+using simd_integer_namespace::track_cycles_test;
 
-//using namespace simd_integer_namespace;
+generic_stats track_cycles_total;
 
-const bool test_mode=false;
-bool test_mode_use_asm=true;
+USED string to_string(mpz_struct* t) {
+    integer t_int;
+    mpz_set(t_int.impl, t);
+    return t_int.to_string();
+}
 
-USED string to_string(mpz_t t) {
-    char* res_char=mpz_get_str(nullptr, 16, t);
-    string res_string="0x";
-    res_string+=res_char;
+bool normalize_fast(integer& a_memory, integer& b_memory, integer& c_memory, bool is_reduce) {
+    track_cycles c_track_cycles(track_cycles_test[5]); // 334
 
-    if (res_string.substr(0, 3)=="0x-") {
-        res_string.at(0)='-';
-        res_string.at(1)='0';
-        res_string.at(2)='x';
+    mpz_struct* a=a_memory.impl;
+    mpz_struct* b=b_memory.impl;
+    mpz_struct* c=c_memory.impl;
+
+    static mpz_t a2, a4, ab, ab_sum, q, r, B, Bb, Bbq, half_Bbq, C;
+
+    static bool is_init=false;
+    if (!is_init) {
+        mpz_inits(a2, a4, ab, ab_sum, q, r, B, Bb, Bbq, half_Bbq, C, NULL);
+        is_init=true;
     }
 
-    free(res_char);
-    return res_string;
-}
-
-struct form {
-    // y = ax^2 + bxy + y^2
-    mpz_t a;
-    mpz_t b;
-    mpz_t c;
-
-    //mpz_t d; // discriminant
- };
-
-ostream& operator<<(ostream& os, const form& f) {
-    return os << "a: " <<  f.a << endl << "b: " << f.b << endl << "c: " << f.c << endl;
-}
-
-mpz_t negative_a, r, denom, old_b, ra, s, x, old_a, g, d, e, q, w, u, a,
-      b, m, k, mu, v, sigma, lambda, h, t, l, j;
-form f3;
-
-inline void normalize(form& f) {
-    mpz_neg(negative_a, f.a);
-    if (mpz_cmp(f.b, negative_a) > 0 && mpz_cmp(f.b, f.a) <= 0) {
-        // Already normalized
-        return;
+    if (is_reduce) {
+        track_cycles c_track_cycles(track_cycles_test[6]); // 142
+        mpz_add(ab, a, b); // ab = a-(-b)
+    } else {
+        track_cycles c_track_cycles(track_cycles_test[7]); // 106
+        mpz_sub(ab, a, b); // ab = a-b
     }
-    // r = (a - b) / 2a
-    // a = a
-    // b = b + 2ra
-    // c = ar^2 + br + c
-    mpz_sub(r, f.a, f.b);
 
-    mpz_mul_ui(denom, f.a, 2);
+    if (!is_reduce) {
+        track_cycles c_track_cycles(track_cycles_test[8]); // 126
+        mpz_add(ab_sum, a, b); // ab_sum = a+b
 
-    // r = (a-b) / 2a
-    mpz_fdiv_q(r, r, denom);
+        // q=0:
+        // A=a
+        // B=b
+        // C=c
 
-    mpz_set(old_b, f.b);
+        // -a<b<=a
+        // -a<b && b<=a
+        // 0<a+b && b-a<=0
+        // a+b>0 && a-b>=0
+        bool already_normalized=(mpz_sgn(ab_sum)>0 && mpz_sgn(ab)>=0); // a+b>0 && a-b>=0
+        if (already_normalized) {
+            //for normalize this is true about 80% of the time
+            return true;
+        }
+    }
 
-    mpz_mul(ra, r, f.a);
-    mpz_add(f.b, f.b, ra);
-    mpz_add(f.b, f.b, ra);
+    {
+        track_cycles c_track_cycles(track_cycles_test[9]); // 110
+        mpz_mul_2exp(a2, a, 1); // a2 = 2a
+    }
 
-    // c += ar^2
-    mpz_mul(ra, ra, r);
-    mpz_add(f.c, f.c, ra);
+    if (!is_reduce) {
+        // q=1:
+        // a-b>=2a && a-b<4a
+        // A=a
+        // B=b+2a
+        // C=a+b+c
 
-    // c += rb
-    mpz_set(ra, r);
-    mpz_mul(ra, ra, old_b);
-    mpz_add(f.c, f.c, ra);
+        track_cycles c_track_cycles(track_cycles_test[10]); // 358
+        mpz_mul_2exp(a4, a2, 1); // a2 = 2a
+
+        bool q_is_1=mpz_cmp(ab, a2)>=0 && mpz_cmp(ab, a4)<0;
+
+        if (q_is_1) {
+            mpz_add(C, ab_sum, c); // C = a+b+c
+            mpz_add(B, b, a2); // B = b+2a
+
+            // a <- A (already done)
+            mpz_swap(b, B); // b <- B
+            mpz_swap(c, C); // c <- C
+
+            //q is always 0 or 1 for normalize experimentally
+            return true;
+        }
+    }
+
+    if (mpz_sgn(a2)==0) {
+        return false;
+    }
+
+    {
+        track_cycles c_track_cycles(track_cycles_test[11]); // 506
+        mpz_fdiv_qr(q, r, ab, a2); // q = (a-b)/(2a) ; r = (a-b)%(2a)
+    }
+
+    // A = a
+    mpz_sub(B, a, r); // B = a-r
+
+    if (is_reduce) {
+        mpz_sub(Bb, B, b); // Bb = B+(-b)
+    } else {
+        mpz_add(Bb, B, b); // Bb = B+b
+    }
+
+    {
+        track_cycles c_track_cycles(track_cycles_test[12]); // 158
+        mpz_mul(Bbq, Bb, q); // Bbq = (B+b)*q
+    }
+    {
+        track_cycles c_track_cycles(track_cycles_test[13]); // 170
+        mpz_fdiv_q_2exp(half_Bbq, Bbq, 1); // half_Bbq = ((B+b)*q)/2
+    }
+    mpz_add(C, half_Bbq, c); // C = ((B+b)*q)/2 + c
+
+    {
+        track_cycles c_track_cycles(track_cycles_test[14]); // 70
+        // a <- A (already done)
+        mpz_swap(b, B); // b <- B
+        mpz_swap(c, C); // c <- C
+    }
+
+    return true;
 }
 
-inline void reduce(form& f) {
-    normalize(f);
+bool reduce_fast(integer& a_memory, integer& b_memory, integer& c_memory) {
+    if (!normalize_fast(a_memory, b_memory, c_memory, false)) {
+        return false;
+    }
 
-    bool use_asm=(test_mode)? test_mode_use_asm : true;
+    //todo bool use_asm=false;
+    bool use_asm=true;
 
     int iter=0;
 
-    while ((mpz_cmp(f.a, f.c) > 0) || (mpz_cmp(f.a, f.c) == 0 && mpz_cmp_si(f.b, 0) < 0)) {
+    while (true) {
         if (use_asm) {
-            if (simd_integer_namespace::integer_reduce_asm(f.a, f.b, f.c)) {
-                if (!((mpz_cmp(f.a, f.c) > 0) || (mpz_cmp(f.a, f.c) == 0 && mpz_cmp_si(f.b, 0) < 0))) {
-                    break;
-                }
-            } else {
+            //this will do the reduce all the way 80% of the time; need to call it multiple times the other 20%
+            if (!simd_integer_namespace::integer_reduce_asm(a_memory.impl, b_memory.impl, c_memory.impl)) {
+                //the asm code could not make any progress so it is going to fail again if it is called
+                //this is very rare
                 use_asm=false;
             }
         }
 
+        int a_c_sign;
+        {
+            track_cycles c_track_cycles(track_cycles_test[15]); // 60
+            a_c_sign=mpz_cmp(a_memory.impl, c_memory.impl);
+        }
+        bool a_greater_than_c=(a_c_sign==1);
+        bool a_equals_c=(a_c_sign==0);
+
+        bool keep_going=a_greater_than_c || (a_equals_c && mpz_sgn(b_memory.impl)==-1);
+
+        if (!keep_going) {
+            break;
+        }
+
+        {
+            track_cycles c_track_cycles(track_cycles_test[16]); // 1826
+            if (!normalize_fast(c_memory, b_memory, a_memory, true)) {
+                return false;
+            }
+        }
+        mpz_swap(a_memory.impl, c_memory.impl);
+
         ++iter;
-
-        mpz_add(s, f.c, f.b);
-
-        // x = 2c
-        mpz_mul_ui(x, f.c, 2);
-        mpz_fdiv_q(s, s, x);
-
-        mpz_set(old_a, f.a);
-        mpz_set(old_b, f.b);
-
-        // b = -b
-        mpz_set(f.a, f.c);
-        mpz_neg(f.b, f.b);
-
-        // x = 2sc
-        mpz_mul(x, s, f.c);
-        mpz_mul_ui(x, x, 2);
-
-        // b += 2sc
-        mpz_add(f.b, f.b, x);
-
-        // c = cs^2
-        mpz_mul(f.c, f.c, s);
-        mpz_mul(f.c, f.c, s);
-
-        // x = bs
-        mpz_mul(x, old_b, s);
-
-        // c -= bs
-        mpz_sub(f.c, f.c, x);
-
-        // c += a
-        mpz_add(f.c, f.c, old_a);
-    }
-    normalize(f);
-
-    //if (test_mode_use_asm && iter>1) {
-        //print(iter);
-    //}
-}
-
-inline form generator_for_discriminant(mpz_t* d) {
-    form x;
-    mpz_init_set_ui(x.a, 2);
-    mpz_init_set_ui(x.b, 1);
-    mpz_init(x.c);
-    //mpz_init_set(x.d, *d);
-
-    // c = b*b - d
-    mpz_mul(x.c, x.b, x.b);
-    mpz_sub(x.c, x.c, *d); //x.d);
-
-    // denom = 4a
-    mpz_mul_ui(denom, x.a, 4);
-
-    mpz_fdiv_q(x.c, x.c, denom);
-    reduce(x);
-    return x;
-}
-
-// Returns mu and v, solving for x:  ax = b mod m
-// such that x = u + vn (n are all integers). Assumes that mu and v are initialized.
-// Returns 0 on success, -1 on failure
-inline int solve_linear_congruence(mpz_t& mu, mpz_t& v, mpz_t& a, mpz_t& b, mpz_t& m) {
-    // g = gcd(a, m), and da + em = g
-    mpz_gcdext(g, d, e, a, m);
-
-    // q = b/g, r = b % g
-    mpz_fdiv_qr(q, r, b, g);
-
-    if (mpz_cmp_ui(r, 0) != 0) {
-        // No solution, return error. Optimize out for speed..
-        cout << "No solution to congruence" << endl;
-        return -1;
-    }
-
-    mpz_mul(mu, q, d);
-    mpz_mod(mu, mu, m);
-
-    mpz_fdiv_q(v, m, g);
-    return 0;
-}
-
-// Faster version without check, and without returning v
-inline int solve_linear_congruence(mpz_t& mu, mpz_t& a, mpz_t& b, mpz_t& m) {
-    if (test_mode && !test_mode_use_asm) {
-        mpz_gcdext(g, d, e, a, m);
-        mpz_fdiv_q(q, b, g);
-        mpz_mul(mu, q, d);
-        mpz_mod(mu, mu, m);
-    } else {
-        simd_integer_namespace::integer_gcd_asm(g, d, nullptr, a, m);
-        mpz_mul(mu, b, d);
-        mpz_mod(mu, mu, m);
-    }
-
-    return 0;
-}
-
-// Takes the gcd of three numbers
-inline void three_gcd(mpz_t& ret, mpz_t& a, mpz_t& b, mpz_t& c) {
-    mpz_gcd(ret, a, b);
-    mpz_gcd(ret, ret, c);
-}
-
-inline form* multiply(form &f1, form &f2) {
-    //assert(mpz_cmp(f1.d, f2.d) == 0);
-
-    // g = (b1 + b2) / 2
-    mpz_add(g, f1.b, f2.b);
-    mpz_fdiv_q_ui(g, g, 2);
-
-
-    // h = (b2 - b1) / 2
-    mpz_sub(h, f2.b, f1.b);
-    mpz_fdiv_q_ui(h, h, 2);
-
-    // w = gcd(a1, a2, g)
-    three_gcd(w, f1.a, f2.a, g);
-
-    // j = w
-    mpz_set(j, w);
-
-    // r = 0
-    mpz_set_ui(r, 0);
-
-    // s = a1/w
-    mpz_fdiv_q(s, f1.a, w);
-
-    // t = a2/w
-    mpz_fdiv_q(t, f2.a, w);
-
-    // u = g/w
-    mpz_fdiv_q(u, g, w);
-
-    // solve (tu)k = (hu + sc1) mod st, of the form k = mu + vn
-
-    // a = tu
-    mpz_mul(a, t, u);
-
-    // b = hu + sc1
-    mpz_mul(b, h, u);
-    mpz_mul(m, s, f1.c);
-    mpz_add(b, b, m);
-
-    // m = st
-    mpz_mul(m, s, t);
-
-    int ret = solve_linear_congruence(mu, v, a, b, m);
-
-    assert(ret == 0);
-
-    // solve (tv)n = (h - t * mu) mod s, of the form n = lamda + sigma n'
-
-    // a = tv
-    mpz_mul(a, t, v);
-
-    // b = h - t * mu
-    mpz_mul(m, t, mu); // use m as a temp variable
-    mpz_sub(b, h, m);
-
-    // m = s
-    mpz_set(m, s);
-
-    ret = solve_linear_congruence(lambda, sigma, a, b, m);
-    assert(ret == 0);
-
-    // k = mu + v*lamda
-    mpz_mul(a, v, lambda); // use a as a temp variable
-
-    mpz_add(k, mu, a);
-
-    // l = (k*t - h) / s
-    mpz_mul(l, k, t);
-    mpz_sub(l, l, h);
-    mpz_fdiv_q(l, l, s);
-
-    // m = (tuk - hu - cs) / st
-    mpz_mul(m, t, u);
-    mpz_mul(m, m, k);
-    mpz_mul(a, h, u); // use a as a temp variable
-    mpz_sub(m, m, a);
-    mpz_mul(a, f1.c, s); // use a as a temp variable
-    mpz_sub(m, m, a);
-    mpz_mul(a, s, t); // use a as a temp variable
-    mpz_fdiv_q(m, m, a);
-
-    // A = st - ru
-    mpz_mul(f3.a, s, t);
-    mpz_mul(a, r, u); // use a as a temp variable
-    mpz_sub(f3.a, f3.a, a);
-
-    // B = ju + mr - (kt + ls)
-    mpz_mul(f3.b, j, u);
-    mpz_mul(a, m, r); // use a as a temp variable
-    mpz_add(f3.b, f3.b, a);
-    mpz_mul(a, k, t); // use a as a temp variable
-    mpz_sub(f3.b, f3.b, a);
-    mpz_mul(a, l, s); // use a as a temp variable
-    mpz_sub(f3.b, f3.b, a);
-
-    // C = kl - jm
-    mpz_mul(f3.c, k, l);
-    mpz_mul(a, j, m);
-    mpz_sub(f3.c, f3.c, a);
-
-    //mpz_set(f3.d, f1.d);
-
-    reduce(f3);
-    return &f3;
-}
-
-/**
- * This algorithm is the same as the composition/multiply algorithm,
- * but simplified to where both inputs are equal (squaring). It also
- * assumes that the discriminant is a negative prime. Algorithm:
- *
- * 1. solve for mu: b(mu) = c mod a
- * 2.  A = a^2
- *     B = B - 2a * mu
- *     C = mu^2 - (b * mu - c)/a
- * 3. reduce f(A, B, C)
- **/
-inline form* square(form &f1) {
-    int ret = solve_linear_congruence(mu, f1.b, f1.c, f1.a);
-    assert(ret == 0);
-
-    mpz_mul(m, f1.b, mu);
-    mpz_sub(m, m, f1.c);
-    mpz_fdiv_q(m, m, f1.a);
-
-    // New a
-    mpz_set(old_a, f1.a);
-    mpz_mul(f3.a, f1.a, f1.a);
-
-    // New b
-    mpz_mul(a, mu, old_a);
-    mpz_mul_ui(a, a, 2);
-    mpz_sub(f3.b, f1.b, a);
-
-    // New c
-    mpz_mul(f3.c, mu, mu);
-    mpz_sub(f3.c, f3.c, m);
-    //mpz_set(f3.d, f1.d);
-    reduce(f3);
-    return &f3;
-}
-
-form copy(form* t) {
-    form x;
-    mpz_init_set(x.a, t->a);
-    mpz_init_set(x.b, t->b);
-    mpz_init_set(x.c, t->c);
-    return x;
-}
-
-// Performs the VDF squaring iterations
-inline form repeated_square(form *f, uint64_t iterations) {
-    for (uint64_t i=0; i < iterations; i++) {
-        if (test_mode) {
-            form f_copy=copy(f);
-
-            test_mode_use_asm=true;
-            form expected_f = copy(square(f_copy));
-
-            test_mode_use_asm=false;
-            f = square(f_copy);
-
-            assert(mpz_cmp(f->a, expected_f.a)==0);
-            assert(mpz_cmp(f->b, expected_f.b)==0);
-            assert(mpz_cmp(f->c, expected_f.c)==0);
-
-            mpz_clear(f_copy.a);
-            mpz_clear(f_copy.b);
-            mpz_clear(f_copy.c);
-
-            mpz_clear(expected_f.a);
-            mpz_clear(expected_f.b);
-            mpz_clear(expected_f.c);
-        } else {
-            f = square(*f);
+        if (iter>reduce_max_iterations) {
+            return false;
         }
     }
-    return *f;
+
+    if (!normalize_fast(a_memory, b_memory, c_memory, false)) {
+        return false;
+    }
+
+    return true;
 }
 
+bool square_fast(integer& a_memory, integer& b_memory, integer& c_memory) {
+    mpz_struct* a=a_memory.impl;
+    mpz_struct* b=b_memory.impl;
+    mpz_struct* c=c_memory.impl;
+
+    track_cycles c_track_cycles(track_cycles_test[17]); // 36444
+
+    static mpz_t g, s, cs, u, A, au, au2, B, bu, buc, buca, uu, C;
+
+    static bool is_init=false;
+    if (!is_init) {
+        mpz_inits(g, s, cs, u, A, au, au2, B, bu, buc, buca, uu, C, NULL);
+        is_init=true;
+    }
+
+    //this assumes the gcd is 1, which it is when doing squaring; it does not assign the gcd output
+    //this also assumes that the second input is >= the first input in magnitude, which is true
+    //also assumes that the second input is nonnegative
+    //todo
+    simd_integer_namespace::integer_gcd_asm(g, s, nullptr, b, a); // s = modular inverse of b wrt. a
+    //mpz_gcdext(g, s, nullptr, b, a);
+
+    // b*u-c === x mod a
+    // b*u === x+c mod a
+    // b*((c*s)%a) === x+c mod a ; c*s = q*a + r ; 0<=r<a ; r = c*s-q*a
+    // b*((q*a+r)%a) === x+c mod a
+    // b*r === x+c mod a
+    // b*(c*s - q*a) === x+c mod a
+    // b*c*s - b*q*a === x+c mod a
+    // b*c*s === x+c mod a
+    // b*c*s-c === x mod a
+    // (b*s-1)*c === x mod a
+    // b*s-1 === y mod a
+    // 1-1 === y mod a ; s is the modular inverse of b wrt. a, so b*s===1 mod a
+    // 0 === y mod a
+    // (b*s-1)*c === 0*c === 0 mod a
+    // b*u-c === 0 mod a
+    //remainder of (b*u-c)/a is 0
+    //
+    //   (b*u-c)/a
+    // = (b*r - c)/a
+    // = (b*(c*s-q*a) - c)/a
+    // = (b*c*s - b*q*a - c)/a
+    // = -b*q + (b*c*s - c)/a
+    // = -b*q + ((b*s-1)*c)/a
+    // = -b*q + c * (b*s-1)/a ; remainder is 0 so can remove c
+    // b*s + a*t = 1
+    // = -b*q + c * (1 - a*t - 1)/a
+    // = -b*q + c * (- a*t)/a
+    // = -(b*q + c*t)
+    //didn't calculate the other cofactor for the gcd so this part isn't useful
+
+    if (mpz_sgn(a)==0) {
+        return false;
+    }
+
+    {
+        track_cycles c_track_cycles(track_cycles_test[18]); // 600
+        mpz_mul(cs, c, s); // cs = c*s
+    }
+    {
+        track_cycles c_track_cycles(track_cycles_test[19]); // 1224
+        mpz_mod(u, cs, a); // u = (c*s) % a
+    }
+
+    {
+        track_cycles c_track_cycles(track_cycles_test[20]); // 376
+        mpz_mul(A, a, a); // A = a*a
+    }
+    {
+        track_cycles c_track_cycles(track_cycles_test[21]); // 534
+        mpz_mul(au, a, u); // au = a*u
+    }
+    {
+        track_cycles c_track_cycles(track_cycles_test[22]); // 88
+        mpz_mul_2exp(au2, au, 1); // au2 = 2*a*u
+    }
+    {
+        track_cycles c_track_cycles(track_cycles_test[23]); // 202
+        mpz_sub(B, b, au2); // B = b - 2*a*u
+    }
+
+    {
+        track_cycles c_track_cycles(track_cycles_test[24]); // 532
+        mpz_mul(bu, b, u); // bu = b*u
+    }
+    {
+        track_cycles c_track_cycles(track_cycles_test[25]); // 146
+        mpz_sub(buc, bu, c); // buc = b*u-c
+    }
+    {
+        track_cycles c_track_cycles(track_cycles_test[26]); // 642
+        mpz_divexact(buca, buc, a); // buca = (b*u-c)/a
+    }
+    {
+        track_cycles c_track_cycles(track_cycles_test[27]); // 360
+        mpz_mul(uu, u, u); // uu = u*u
+    }
+    {
+        track_cycles c_track_cycles(track_cycles_test[28]); // 122
+        mpz_sub(C, uu, buca); // C = u*u - (b*u-c)/a
+    }
+
+    {
+        track_cycles c_track_cycles(track_cycles_test[29]); // 40
+        mpz_swap(a, A); // a <- A
+        mpz_swap(b, B); // b <- B
+        mpz_swap(c, C); // c <- C
+    }
+
+    return true;
+}
+
+void square_original(form& f) {
+    vdf_original::form f_in;
+    f_in.a[0]=f.a.impl[0];
+    f_in.b[0]=f.b.impl[0];
+    f_in.c[0]=f.c.impl[0];
+
+    vdf_original::form& f_res=*vdf_original::square(f_in);
+
+    mpz_set(f.a.impl, f_res.a);
+    mpz_set(f.b.impl, f_res.b);
+    mpz_set(f.c.impl, f_res.c);
+}
+
+bool square_fast(form& f) {
+    track_cycles c_track_cycles(track_cycles_total);
+
+    static form f_copy;
+    if (test_correctness) {
+        f_copy=f;
+    }
+
+    const int d_bits=2048;
+    const int extra_d_bits=256; //calculated_d_bits is an upper bound so it is too high
+
+    if (!square_fast(f.a, f.b, f.c)) {
+        assert(!test_correctness);
+        return false;
+    }
+
+    //todo reduce(f.a, f.b, f.c);
+    if (!reduce_fast(f.a, f.b, f.c)) {
+        assert(!test_correctness);
+        return false;
+    }
+
+    // d=b^2-4ac
+    // log2(d) ~ max(2*log2(|b|), 2+log2(a)+log2(c))+1
+    // log2(x) < number of bits in x
+
+    track_cycles c_track_cycles_2(track_cycles_test[30]);
+    int a_bits=mpz_num_bits_upper_bound(f.a.impl);
+    int b_bits=mpz_num_bits_upper_bound(f.b.impl);
+    int c_bits=mpz_num_bits_upper_bound(f.c.impl);
+
+    int calculated_d_bits=max(2*b_bits, 2+a_bits+c_bits)+1;
+
+    //want to make sure the values aren't growing without bound due to a bug
+    bool res=calculated_d_bits<d_bits+extra_d_bits;
+
+    //a and c must be positive (if a or c are 0 then the discriminant is positive which is wrong)
+    res&=(mpz_sgn(f.a.impl)==1);
+    res&=(mpz_sgn(f.c.impl)==1);
+
+    if (test_correctness) {
+        assert(res);
+
+        form f_copy_2=f_copy;
+        square_original(f_copy_2);
+        assert(f==f_copy_2);
+    }
+
+    return res;
+}
+
+struct repeated_square {
+    integer d;
+
+    int64 checkpoint_iteration=0;
+    form checkpoint;
+
+    int64 current_iteration=0;
+    form current;
+
+    int64 num_iterations=0;
+
+    bool error_mode=false;
+
+    bool is_checkpoint() {
+        return
+            current_iteration==num_iterations ||
+            (current_iteration & (repeated_square_checkpoint_interval-1)) == 0
+        ;
+    }
+
+    void advance_fast(bool& did_rollback) {
+        bool is_error=false;
+
+        if (!square_fast(current)) {
+            is_error=true;
+        }
+
+        if (!is_error) {
+            ++current_iteration;
+            if (is_checkpoint() && !current.check_valid(d)) {
+                is_error=true;
+            }
+        }
+
+        if (is_error) {
+            if (debug_rollback) {
+                print( "Rollback", current_iteration, " -> ", checkpoint_iteration );
+            }
+
+            current_iteration=checkpoint_iteration;
+            current=checkpoint;
+            error_mode=true;
+            did_rollback=true;
+            assert(!assert_on_rollback);
+        }
+    }
+
+    void advance_error() {
+        square_original(current);
+        ++current_iteration;
+    }
+
+    void advance() {
+        bool did_rollback=false;
+        if (error_mode) {
+            advance_error();
+        } else {
+            advance_fast(did_rollback);
+        }
+
+        if (!did_rollback && is_checkpoint()) {
+            checkpoint_iteration=current_iteration;
+            checkpoint=current;
+            error_mode=false;
+        }
+    }
+
+    repeated_square(integer t_d, form initial, int64 t_num_iterations) {
+        d=t_d;
+        checkpoint=initial;
+        current=initial;
+        num_iterations=t_num_iterations;
+
+        while (current_iteration<num_iterations) {
+            advance();
+        }
+    }
+};
+
 int main(int argc, char* argv[]) {
+    if (!assert_on_rollback && getenv( "VDF_ASSERT_ON_ROLLBACK" )) {
+        assert_on_rollback=true;
+    }
+
+    #if VDF_MODE!=0
+        print( "=== Test mode ===" );
+    #endif
+
     set_rounding_mode();
 
     simd_integer_namespace::init_asm_runtime();
+    vdf_original::init();
 
-    mpz_inits(negative_a, r, denom, old_a, old_b, ra, s, x, g, d, e, q, w, m,
-              u, a, b, k, mu, v, sigma, lambda, f3.a, f3.b, f3.c, //f3.d,
-              NULL);
+    integer d(argv[1]);
+    int64 num_iterations=from_string<int64>(argv[2]);
 
-    mpz_t discriminant;
-    int ret = mpz_init_set_str(discriminant, argv[1], 0);
-    uint64_t iterations = stoi(argv[2]);
-    assert(ret == 0);
-    form x = generator_for_discriminant(&discriminant);
-    form y = repeated_square(&x, iterations);
+    repeated_square c_square(d, form::generator(d), num_iterations);
 
-    // Outputs a and b of final element
-    cout << y.a << endl << y.b;
+    cout << c_square.current.a.impl << "\n";
+    cout << c_square.current.b.impl;
+
+    if (enable_track_cycles) {
+        print( "" );
+        print( "" );
+
+        simd_integer_namespace::track_cycles_reduce.output( "track_cycles_reduce" );
+        simd_integer_namespace::track_cycles_gcd.output( "track_cycles_gcd" );
+        track_cycles_total.output( "track_cycles_total" );
+
+        for (int x=0;x<track_cycles_test.size();++x) {
+            if (track_cycles_test[x].entries.empty()) {
+                continue;
+            }
+            track_cycles_test[x].output(str( "track_cycles_test_#", x ));
+        }
+    }
 }

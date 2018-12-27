@@ -454,6 +454,8 @@ template<int size, int num_vectors> struct matrix_multiplier_asm {
 
     scheduler c_scheduler;
 
+    int cutoff=0; //this many lsb limbs in the tail are 0 (only for the first vector)
+
     void bind() {
         m.bind(carry_accumulator, "carry_accumulator");
         m.bind(carry_mask_reg, "carry_mask");
@@ -463,6 +465,19 @@ template<int size, int num_vectors> struct matrix_multiplier_asm {
         m.bind(current_batch, "current_batch");
 
         bind_spillable(matrix_buffer, "matrix_buffer");
+    }
+
+    //this is the number of shrunked off limbs multiplied by 8
+    void get_cutoff_8(reg_alloc regs, reg_scalar res) {
+        EXPAND_MACROS_SCOPE;
+
+        bind();
+        m.bind(res, "res");
+
+        //for each limb that was shrunk off, c_memory_base is reduced by 8
+        APPEND_M(str( "MOV `res, `memory_base" ));
+        APPEND_M(str( "SUB `res, `c_memory_base" )); // tmp = memory_base - c_memory_base
+        //APPEND_M(str( "SHR `res, #", to_hex(3) )); // tmp = (memory_base - c_memory_base)/8
     }
 
     void has_tail(reg_alloc regs, reg_scalar tmp, string branch_has_tail, string branch_no_tail, bool small_head=true) {
@@ -624,6 +639,7 @@ template<int size, int num_vectors> struct matrix_multiplier_asm {
         preserve_carry_mask_and_accumulator=false;
 
         //current_batch is done being generated and previous_batch is done being used, so generate new previous_batch
+        //if is_identity is true, the output wouldn't get used anyway so it is not calculated
         for (int vector_index=0;vector_index<num_vectors;++vector_index) {
             multiply_matrix_batch<size>(regs, previous_batch[vector_index], current_batch[vector_index]);
         }
@@ -746,12 +762,15 @@ template<int size, int num_vectors> struct matrix_multiplier_asm {
     void generate_background_work_carry(bool assign_accumulator) {
         for (int vector_index=0;vector_index<num_vectors;++vector_index) {
             int c_head_size=(vector_index==0)? head_size : 0;
+            int start=(vector_index==0)? cutoff : 0;
+
+            assert(start%4==0 && start<=int_size-c_head_size);
 
             if (c_head_size==int_size) {
                 continue;
             }
 
-            for (int index=int_size-c_head_size-4;index>=0;index-=4) {
+            for (int index=int_size-c_head_size-4;index>=start;index-=4) {
                 //15/18 alu ops (size==3; 15 no accumulator ; 18 with accumulator)
                 c_scheduler+=[=](reg_alloc regs) {
                     expand_macros_tag c_tag(m, "bg_carry");
@@ -841,9 +860,9 @@ template<int size, int num_vectors> struct matrix_multiplier_asm {
     }
 
     void generate_all_carry_work() {
-        assert(!preserve_carry_mask_and_accumulator); //used to decide when to assign carry_mask
-
         int scheduler_start=c_scheduler.all_work.size();
+
+        assert(!preserve_carry_mask_and_accumulator); //used to decide when to assign carry_mask
 
         generate_background_work_carry_extra(false, false);
         generate_background_work_carry(false);
@@ -878,10 +897,14 @@ template<int size, int num_vectors> struct matrix_multiplier_asm {
                 continue;
             }
 
+            int start=(vector_index==0)? cutoff : 0;
+
+            assert(start%4==0 && start<=int_size-c_head_size);
+
             for (int pass=0;pass<4;++pass) {
                 int last_index=(vector_index==0)? int_size-c_head_size : int_size-4;
 
-                for (int index=last_index;index>=0;index-=4) {
+                for (int index=last_index;index>=start;index-=4) {
                     bool is_extra=(vector_index==0 && index==last_index);
 
                     //18 alu ops (size==3)
@@ -967,6 +990,23 @@ template<int size, int num_vectors> struct matrix_multiplier_asm {
 
         //left multiplying, so first matrix is stored last in current_batch
         assign_current_batch<size>(regs, current_batch[0][3-pass], c_matrix);
+
+        string skip_multiply_label=m.alloc_label();
+        {
+            asm_immediate.assign(carry_accumulator, ~uint64(0));
+            for (int x=0;x<size;++x) {
+                array<uint64, 4> identity_row={0, 0, 0, 0};
+                identity_row[x]=1;
+
+                APPEND_M(str( "VPCMPEQQ `carry_mask, `c_matrix_#, #", x, asm_immediate(identity_row) ));
+                APPEND_M(str( "VPAND `carry_accumulator, `carry_accumulator, `carry_mask" ));
+            }
+
+            //if all of the bits in the accumulator are set, the input is the identity matrix
+            APPEND_M(str( "VPTEST `carry_accumulator, #", asm_immediate(~uint64(0)) )); //sets CF if input is the identity matrix
+            APPEND_M(str( "JC #", skip_multiply_label ));
+        }
+
         assign_matrix_buffer<size>(regs, matrix_buffer, current_batch[0][3-pass]);
         matrix_buffer_state=-1;
 
@@ -1064,6 +1104,8 @@ template<int size, int num_vectors> struct matrix_multiplier_asm {
 
             APPEND_M(str( "#:", skip_negate_label ));
         }
+
+        APPEND_M(str( "#:", skip_multiply_label ));
 
         if (preserve_carry_mask_and_accumulator) {
             APPEND_M(str( "VMOVDQU `carry_accumulator, `carry_accumulator_copy" ));
@@ -1272,6 +1314,7 @@ void gcd(
 
     reg_spill total_num_iterations=regs.bind_spill(m, "total_num_iterations");
     reg_spill terminated=regs.bind_spill(m, "terminated");
+    reg_spill loop_count=regs.bind_spill(m, "loop_count");
     reg_spill c_gcd_mask=regs.bind_spill(m, "c_gcd_mask");
 
     simd_integer_asm a=remove_padding(regs, a_padded);
@@ -1300,6 +1343,7 @@ void gcd(
 
         m.bind(total_num_iterations, "total_num_iterations");
         m.bind(terminated, "terminated");
+        m.bind(loop_count, "loop_count");
         m.bind(c_gcd_mask, "c_gcd_mask");
 
         reg_scalar tmp=regs_copy.bind_scalar(m, "tmp");
@@ -1308,6 +1352,7 @@ void gcd(
         asm_immediate.assign(tmp, 0);
         APPEND_M(str( "MOV `total_num_iterations, `tmp" ));
         APPEND_M(str( "MOV `terminated, `tmp" ));
+        APPEND_M(str( "MOV `loop_count, `tmp" ));
 
         asm_immediate.assign(tmp_2, gcd_mask_approximate);
         APPEND_M(str( "VMOVDQU `c_gcd_mask, `tmp_2" ));
@@ -1332,6 +1377,21 @@ void gcd(
     {
         string loop_label=m.alloc_label();
         APPEND_M(str( "#:", loop_label ));
+
+        {
+            EXPAND_MACROS_SCOPE;
+            reg_alloc regs_copy=regs;
+
+            m.bind(loop_count, "loop_count");
+
+            reg_scalar tmp=regs_copy.bind_scalar(m, "tmp");
+
+            APPEND_M(str( "MOV `tmp, `loop_count" ));
+            APPEND_M(str( "INC `tmp" ));
+            APPEND_M(str( "MOV `loop_count, `tmp" ));
+            APPEND_M(str( "CMP `tmp, #", to_hex(1000) ));
+            APPEND_M(str( "JG #", m.alloc_error_label() ));
+        }
 
         c_multiplier.generate_background_work();
         for (int x=0;x<4;++x) {

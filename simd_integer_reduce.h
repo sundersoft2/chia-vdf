@@ -4,6 +4,8 @@ namespace simd_integer_namespace {
 todo //jump table for both reduce and gcd
 todo //interleave background work better for gcd
 
+todo // forgot a factor of 3 for the error bound. also add it to the asm cdoe
+
 vector3 mul_matrix_vector(matrix3 c_matrix, vector3 v) {
     vector3 res;
     for (int y=0;y<3;++y) {
@@ -39,7 +41,7 @@ void reduce_64(vector3 start_a, pair<matrix3, vector3>& res, int& num_iterations
             }
         }
 
-        if (a[2]>=a[0] || a[2]==0) {
+        if (a[2]>=a[0] || (a[2]<<1)==0) {
             break;
         }
 
@@ -95,8 +97,9 @@ void reduce_64(vector3 start_a, pair<matrix3, vector3>& res, int& num_iterations
         }
 
         //2(|q|+1)E < a'-|b'|
-        //also E has to not be too big
-        bool valid=( 2*(abs_int(q)+1)*max_uv < new_a[0]-abs_int(new_a[1]) ) && max_uv<=data_mask;
+        // E = 3*max_uv
+        //also max_uv has to not be too big
+        bool valid=( 6*(abs_int(q)+1)*max_uv < new_a[0]-abs_int(new_a[1]) ) && max_uv<=data_mask;
 
         if (!valid) {
             break;

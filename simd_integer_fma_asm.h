@@ -759,5 +759,181 @@ template<int num> void extract_bits_shifted(
     APPEND_M(str( "JNZ #", m.alloc_error_label() )); //jump taken if last data bit is set in a[expected_size]
 } */
 
+struct batched_bit_shifts_entry {
+    map<int, int /*shift amount*/> sources;
+};
+
+struct batched_bit_shifts_entries {
+    vector<batched_bit_shifts_entry> entries;
+
+    batched_bit_shifts_entries(int t_output_size) {
+        assert(t_output_size%4==0);
+        entries.resize(t_output_size);
+    }
+
+    void add(int output_index, int input_index, int amount) {
+        assert(amount>-64 && amount<64);
+        auto& v=entries.at(output_index).sources;
+        assert(!v.count(input_index));
+        v[input_index]=amount;
+    }
+};
+
+//if the input or output is a gmp integer, the start is set to 0 and the register is set to the address register for the gmp integer
+//the entire output is buffered in registers, so should call this multiple times with different offsets to apply this to a large output
+void batched_bit_shifts_impl(
+    reg_alloc regs, simd_integer_asm input, simd_integer_asm output, vector<batched_bit_shifts_entry> entries, bool zero_carry
+) {
+    EXPAND_MACROS_SCOPE;
+
+    vector<reg_vector> output_buffers;
+    for (int x=0;x<output.size/4;++x) {
+        output_buffers.push_back(regs.get_vector());
+    }
+    m.bind(output_buffers, "output_buffers");
+
+    reg_vector input_buffer=regs.bind_vector(m, "input_buffer");
+    reg_vector tmp=regs.bind_vector(m, "tmp");
+
+    for (int x=0;x<output.size/4;++x) {
+        asm_immediate.assign(output_buffers[x], 0);
+    }
+
+    assert(entries.size()==output.size);
+    assert(entries.size()%4==0);
+    for (int x=0;x<input.size;++x) {
+        bool did_broadcast=false;
+
+        for (int is_right=0;is_right<2;++is_right) {
+            for (int y=0;y<entries.size();y+=4) {
+                //array<int, 4> blend_mask={0, 0, 0, 0};
+                array<uint64, 4> shift_amounts={~uint64(0), ~uint64(0), ~uint64(0), ~uint64(0)};
+
+                bool has_shift=false;
+                for (int z=0;z<4;++z) {
+                    auto i=entries.at(y+z).sources.find(x);
+                    if (i==entries.at(y+z).sources.end()) {
+                        continue;
+                    }
+
+                    bool i_is_right=(i->second)<0;
+                    if (i_is_right!=is_right) {
+                        continue;
+                    }
+
+                    int amount=(i_is_right)? -i->second : i->second;
+                    assert(amount>=0 && amount<64);
+
+                    //blend_mask[z]=1;
+                    shift_amounts[z]=amount;
+                    has_shift=true;
+                }
+
+                if (!has_shift) {
+                    continue;
+                }
+
+                if (!did_broadcast) {
+                    APPEND_M(str( "VPBROADCASTQ `input_buffer, #", input[x] ));
+                    did_broadcast=true;
+                }
+
+                if (is_right) {
+                    APPEND_M(str( "VPSRLVQ `tmp, `input_buffer, #", asm_immediate(shift_amounts) ));
+                } else {
+                    APPEND_M(str( "VPSLLVQ `tmp, `input_buffer, #", asm_immediate(shift_amounts) ));
+                }
+
+                APPEND_M(str( "VPOR `output_buffers_#, `tmp, `output_buffers_#", y/4, y/4 ));
+                //APPEND_M(str( "VPBLENDD `output_buffers_#, `output_buffers_#, `tmp, #", y/4, y/4, vpblendd_mask_4(blend_mask) ));
+            }
+        }
+    }
+
+    if (zero_carry) {
+        asm_immediate.assign(tmp, data_mask);
+    }
+
+    for (int x=0;x<output.size/4;++x) {
+        if (zero_carry) {
+            APPEND_M(str( "VPAND `output_buffers_#, `output_buffers_#, `tmp", x, x ));
+        }
+
+        APPEND_M(str( "VMOVDQU #, `output_buffers_#", output[x*4], x ));
+    }
+}
+
+void batched_bit_shifts(
+    reg_alloc regs, simd_integer_asm input, simd_integer_asm output, batched_bit_shifts_entries entries, bool zero_carry
+) {
+    const int batch_size=14*4;
+
+    vector<batched_bit_shifts_entry> batch_entries;
+
+    assert(output.size==entries.entries.size());
+    for (int x=0;x<output.size;x+=batch_size) {
+        int end_x=x+batch_size;
+        if (end_x>output.size) {
+            end_x=output.size;
+        }
+
+        batch_entries.clear();
+        for (int y=x;y<end_x;++y) {
+            batch_entries.push_back(entries.entries.at(y));
+        }
+
+        simd_integer_asm c_output=output;
+        c_output.start+=x;
+        c_output.size=end_x-x;
+        batched_bit_shifts_impl(regs, input, c_output, batch_entries, zero_carry);
+    }
+}
+
+void simd_to_mpz(
+    reg_alloc regs, simd_integer_asm input, simd_integer_asm output
+) {
+    input.assert_valid();
+    output.assert_valid();
+
+    batched_bit_shifts_entries entries(output.size);
+
+    for (int input_index=0;input_index<input.size;++input_index) {
+        for (int output_index=0;output_index<output.size;++output_index) {
+            int input_start=data_size*input_index;
+            int output_start=64*output_index;
+            int amount=input_start-output_start;
+
+            if (amount>-data_size && amount<64) {
+                entries.add(output_index, input_index, amount);
+            }
+        }
+    }
+
+    batched_bit_shifts(regs, input, output, entries, false);
+}
+
+void mpz_to_simd(
+    reg_alloc regs, simd_integer_asm input, simd_integer_asm output
+) {
+    input.assert_valid();
+    output.assert_valid();
+
+    batched_bit_shifts_entries entries(output.size);
+
+    for (int input_index=0;input_index<input.size;++input_index) {
+        for (int output_index=0;output_index<output.size;++output_index) {
+            int input_start=64*input_index;
+            int output_start=data_size*output_index;
+            int amount=input_start-output_start;
+
+            if (amount>-64 && amount<data_size) {
+                entries.add(output_index, input_index, amount);
+            }
+        }
+    }
+
+    batched_bit_shifts(regs, input, output, entries, true);
+}
+
 
 }

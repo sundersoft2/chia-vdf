@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <deque>
 #include <cfenv>
+#include <ctime>
 
 #include <x86intrin.h>
 

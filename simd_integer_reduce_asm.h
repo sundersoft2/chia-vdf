@@ -29,19 +29,18 @@ void reduce_64_iteration(
     APPEND_M(str( "OR `tmp_a, `a_2" ));
     APPEND_M(str( "JS #", early_exit_label )); //early exit if either sign bit is 1
 
-    //if (a[2]>=a[0] || a[2]==0) { break; }
+    //if (a[2]>=a[0] || (a[2]<<1)==0) { break; }
     APPEND_M(str( "CMP `a_2, `a_0" ));
     APPEND_M(str( "JGE #", early_exit_label ));
-
-    APPEND_M(str( "CMP `a_2, 0" ));
-    APPEND_M(str( "JE #", early_exit_label ));
 
     //int64 q;
     //int64 r=divide_table(a[1]+a[2], a[2]<<1, q);
     APPEND_M(str( "MOV `tmp_a, `a_1" ));
     APPEND_M(str( "ADD `tmp_a, `a_2" ));
     APPEND_M(str( "MOV `tmp_b, `a_2" ));
+
     APPEND_M(str( "SHL `tmp_b, 0x1" ));
+    APPEND_M(str( "JZ #", early_exit_label ));
     divide_table(regs, tmp_a, tmp_b, q, r);
 
     APPEND_M(str( "MOV `tmp_a, `q" ));
@@ -115,7 +114,7 @@ void reduce_64_iteration(
 
     APPEND_M(str( "VMOVD `tmp_a_32, `max_uv_128" )); //zero extended to 64 bits
 
-    //bool valid=( 2*(abs_int(q)+1)*max_uv < new_a[0]-abs_int(new_a[1]) ) && max_uv<=data_mask;
+    //bool valid=( 6*(abs_int(q)+1)*max_uv < new_a[0]-abs_int(new_a[1]) ) && max_uv<=data_mask;
     // 2*(abs_int(q)+1)*max_uv + abs_int(new_a[1]) - new_a[0] < 0
 
     //q=|q|
@@ -125,9 +124,10 @@ void reduce_64_iteration(
     APPEND_M(str( "XOR `q, `tmp_b" )); // q = (q + mask) ^ mask;
 
     APPEND_M(str( "INC `q" )); // |q|+1
-    APPEND_M(str( "SHL `q, 0x1" )); // 2*(|q|+1)
-    APPEND_M(str( "IMUL `q, `tmp_a" )); // 2*(|q|+1)*max_uv
-    APPEND_M(str( "SUB `q, `a_2" )); // 2*(|q|+1)*max_uv - new_a[0]
+    //APPEND_M(str( "SHL `q, 0x1" )); // 6*(|q|+1)
+    APPEND_M(str( "IMUL `q, `q, #", to_hex(6) )); // 6*(|q|+1)
+    APPEND_M(str( "IMUL `q, `tmp_a" )); // 6*(|q|+1)*max_uv
+    APPEND_M(str( "SUB `q, `a_2" )); // 6*(|q|+1)*max_uv - new_a[0]
 
     //r=|new_a[1]|
     APPEND_M(str( "MOV `r, `new_a_1" ));
@@ -136,7 +136,7 @@ void reduce_64_iteration(
     APPEND_M(str( "ADD `r, `tmp_b" ));
     APPEND_M(str( "XOR `r, `tmp_b" ));
 
-    APPEND_M(str( "ADD `q, `r" )); // 2*(|q|+1)*max_uv + abs_int(new_a[1]) - new_a[0]
+    APPEND_M(str( "ADD `q, `r" )); // 6*(|q|+1)*max_uv + abs_int(new_a[1]) - new_a[0]
     APPEND_M(str( "JNS #", early_exit_label )); // not valid if >= 0 (i.e. sign flag is 0)
 
     //uv=new_uv;
@@ -270,6 +270,7 @@ void reduce(
     EXPAND_MACROS_SCOPE;
 
     reg_spill terminated=regs.bind_spill(m, "terminated");
+    reg_spill loop_count=regs.bind_spill(m, "loop_count");
 
     simd_integer_asm a=remove_padding(regs, a_padded);
     simd_integer_asm b=remove_padding(regs, b_padded);
@@ -292,11 +293,13 @@ void reduce(
         reg_alloc regs_copy=regs;
 
         m.bind(terminated, "terminated");
+        m.bind(loop_count, "loop_count");
 
         reg_scalar tmp=regs_copy.bind_scalar(m, "tmp");
 
         asm_immediate.assign(tmp, 0);
         APPEND_M(str( "MOV `terminated, `tmp" ));
+        APPEND_M(str( "MOV `loop_count, `tmp" ));
     }
 
     matrix_multiplier_asm<3, 1> c_multiplier;
@@ -310,9 +313,82 @@ void reduce(
 
     print( "reduce main loop:" );
 
+    const vector<int> cutoffs={0, 16}; //sorted
+
+    string loop_label=m.alloc_label();
+    string loop_exit_label=m.alloc_label();
+
+    vector<string> cutoff_labels;
+    for (int x=0;x<cutoffs.size();++x) {
+        cutoff_labels.push_back(m.alloc_label());
+    }
+
+    APPEND_M(str( "JMP #", loop_label ));
+
+    string jump_table=m.alloc_label();
     {
-        string loop_label=m.alloc_label();
-        APPEND_M(str( "#:", loop_label ));
+        APPEND_M(str( ".balign 8" ));
+        APPEND_M(str( "#:", jump_table ));
+        for (int cutoff=0;cutoff<c_multiplier.int_size;++cutoff) {
+
+            int cutoff_index=-1;
+            for (int x=0;x<cutoffs.size();++x) {
+                //static cutoff can be less than or equal to the calculated value
+                if (cutoffs[x]>cutoff) {
+                    break;
+                }
+                cutoff_index=x;
+            }
+            assert(cutoff_index!=-1);
+
+            APPEND_M(str( ".quad #", cutoff_labels.at(cutoff_index) ));
+        }
+    }
+
+    APPEND_M(str( "#:", loop_label ));
+    {
+        EXPAND_MACROS_SCOPE;
+        reg_alloc regs_copy=regs;
+
+        reg_scalar cutoff_8=regs_copy.bind_scalar(m, "cutoff_8");
+        reg_scalar table_address=regs_copy.bind_scalar(m, "table_address");
+        reg_scalar tmp=regs_copy.bind_scalar(m, "tmp");
+
+        c_multiplier.get_cutoff_8(regs_copy, cutoff_8);
+
+        string rip_label=m.alloc_label();
+
+        //if you try to do this in the LEA instruction then the assembler will add garbage instead of the actual value
+        //trying to disable position independent code makes the assembly code not work anymore; calling conventions might be different
+        // or something
+        APPEND_M(str( "MOV `tmp, #-#", jump_table, rip_label ));
+
+        APPEND_M(str( "LEA `table_address, [RIP]" ));
+        APPEND_M(str( "#:", rip_label ));
+
+        APPEND_M(str( "ADD `table_address, `tmp" ));
+
+        APPEND_M(str( "JMP [`table_address+`cutoff_8]" ));
+    }
+
+    for (int y=0;y<cutoffs.size();++y) {
+        APPEND_M(str( "#:", cutoff_labels[y] ));
+        c_multiplier.cutoff=cutoffs[y];
+
+        {
+            EXPAND_MACROS_SCOPE;
+            reg_alloc regs_copy=regs;
+
+            m.bind(loop_count, "loop_count");
+
+            reg_scalar tmp=regs_copy.bind_scalar(m, "tmp");
+
+            APPEND_M(str( "MOV `tmp, `loop_count" ));
+            APPEND_M(str( "INC `tmp" ));
+            APPEND_M(str( "MOV `loop_count, `tmp" ));
+            APPEND_M(str( "CMP `tmp, #", to_hex(1000) ));
+            APPEND_M(str( "JG #", m.alloc_error_label() ));
+        }
 
         c_multiplier.generate_background_work();
         for (int x=0;x<4;++x) {
@@ -331,11 +407,14 @@ void reduce(
             APPEND_M(str( "MOV `tmp, `terminated" ));
             APPEND_M(str( "CMP `tmp, 0" ));
             APPEND_M(str( "JE #", loop_label ));
+            APPEND_M(str( "JMP #", loop_exit_label ));
         }
     }
+    APPEND_M(str( "#:", loop_exit_label ));
 
     print( "reduce finish:" );
 
+    c_multiplier.cutoff=0;
     c_multiplier.generate_background_work();
     for (int pass=0;pass<4;++pass) {
         EXPAND_MACROS_SCOPE;
