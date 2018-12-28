@@ -34,7 +34,7 @@ namespace vdf_original {
 
     inline void normalize(form& f) {
         mpz_neg(negative_a, f.a);
-        if (mpz_cmp(f.b, negative_a) > 0 && mpz_cmp(f.b, f.a) <= 0) { todo //add this to my code if it helps
+        if (mpz_cmp(f.b, negative_a) > 0 && mpz_cmp(f.b, f.a) <= 0) {
             // Already normalized
             return;
         }

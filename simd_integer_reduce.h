@@ -1,11 +1,6 @@
 namespace simd_integer_namespace {
 
 
-todo //jump table for both reduce and gcd
-todo //interleave background work better for gcd
-
-todo // forgot a factor of 3 for the error bound. also add it to the asm cdoe
-
 vector3 mul_matrix_vector(matrix3 c_matrix, vector3 v) {
     vector3 res;
     for (int y=0;y<3;++y) {

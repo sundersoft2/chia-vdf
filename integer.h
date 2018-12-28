@@ -98,7 +98,7 @@ track_max_type track_max;
 typedef __mpz_struct mpz_struct;
 
 int mpz_num_bits_upper_bound(mpz_struct* v) {
-    return mpz_size(v)*sizeof(mp_limb_t);
+    return mpz_size(v)*sizeof(mp_limb_t)*8;
 }
 
 struct integer {

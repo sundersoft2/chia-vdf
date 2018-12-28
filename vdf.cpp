@@ -1,6 +1,6 @@
 #include "include.h"
 
-//used for the final submission and correctness testing. correctness testing defines the VDF_ASSERT_ON_ROLLBACK environment variable
+//used for the final submission and correctness testing
 #define VDF_MODE 0
 
 //used for performance or other testing
@@ -12,19 +12,19 @@
 #if VDF_MODE==0
     const bool enable_track_cycles=false;
     const bool test_correctness=false;
-    bool assert_on_rollback=false;
+    const bool assert_on_rollback=false;
     const bool debug_rollback=false;
     const int asm_inject_random_errors_rate=0;
-    const int repeated_square_checkpoint_interval=1<<17; //should be a power of 2
+    const int repeated_square_checkpoint_interval=1<<10; //should be a power of 2
 #endif
 
 #if VDF_MODE==1
     const bool enable_track_cycles=true;
     const int test_correctness=true;
-    bool assert_on_rollback=true;
+    const bool assert_on_rollback=true;
     const bool debug_rollback=false;
     const int asm_inject_random_errors_rate=0;
-    const int repeated_square_checkpoint_interval=1<<17;
+    const int repeated_square_checkpoint_interval=1<<10;
 #endif
 
 const int reduce_max_iterations=10000;
@@ -45,6 +45,7 @@ USED string to_string(mpz_struct* t) {
     return t_int.to_string();
 }
 
+//setting is_reduce to true will negate b but not swap a or c; caller needs to do that
 bool normalize_fast(integer& a_memory, integer& b_memory, integer& c_memory, bool is_reduce) {
     track_cycles c_track_cycles(track_cycles_test[5]); // 334
 
@@ -176,13 +177,13 @@ bool reduce_fast(integer& a_memory, integer& b_memory, integer& c_memory) {
             }
         }
 
-        int a_c_sign;
+        int a_c_cmp;
         {
             track_cycles c_track_cycles(track_cycles_test[15]); // 60
-            a_c_sign=mpz_cmp(a_memory.impl, c_memory.impl);
+            a_c_cmp=mpz_cmp(a_memory.impl, c_memory.impl); // this can be any integer, not just -1, 0, or 1
         }
-        bool a_greater_than_c=(a_c_sign==1);
-        bool a_equals_c=(a_c_sign==0);
+        bool a_greater_than_c=(a_c_cmp>0);
+        bool a_equals_c=(a_c_cmp==0);
 
         bool keep_going=a_greater_than_c || (a_equals_c && mpz_sgn(b_memory.impl)==-1);
 
@@ -337,6 +338,15 @@ void square_original(form& f) {
     mpz_set(f.c.impl, f_res.c);
 }
 
+void output_error(form start, int location) {
+    print( "=== error ===" );
+    print(start.a.to_string());
+    print(start.b.to_string());
+    print(start.c.to_string());
+    print(location);
+    assert(false);
+}
+
 bool square_fast(form& f) {
     track_cycles c_track_cycles(track_cycles_total);
 
@@ -349,13 +359,17 @@ bool square_fast(form& f) {
     const int extra_d_bits=256; //calculated_d_bits is an upper bound so it is too high
 
     if (!square_fast(f.a, f.b, f.c)) {
-        assert(!test_correctness);
+        if (test_correctness) {
+            output_error(f_copy, 0);
+        }
         return false;
     }
 
     //todo reduce(f.a, f.b, f.c);
     if (!reduce_fast(f.a, f.b, f.c)) {
-        assert(!test_correctness);
+        if (test_correctness) {
+            output_error(f_copy, 1);
+        }
         return false;
     }
 
@@ -378,11 +392,15 @@ bool square_fast(form& f) {
     res&=(mpz_sgn(f.c.impl)==1);
 
     if (test_correctness) {
-        assert(res);
+        if (!res) {
+            output_error(f_copy, 2);
+        }
 
         form f_copy_2=f_copy;
         square_original(f_copy_2);
-        assert(f==f_copy_2);
+        if (!(f==f_copy_2)) {
+            output_error(f_copy, -1);
+        }
     }
 
     return res;
@@ -468,10 +486,6 @@ struct repeated_square {
 };
 
 int main(int argc, char* argv[]) {
-    if (!assert_on_rollback && getenv( "VDF_ASSERT_ON_ROLLBACK" )) {
-        assert_on_rollback=true;
-    }
-
     #if VDF_MODE!=0
         print( "=== Test mode ===" );
     #endif
