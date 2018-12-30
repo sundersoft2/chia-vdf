@@ -2,7 +2,7 @@
 
 For the VDF, Lehmer's algorithm for calculating the GCD has been extended to reduce a quadratic form. Also, a SIMD two's complement implementation of integers is used and Lehmer's algorithm is parallelized to some extent to make better use of superscalar CPU cores (it still runs on a single thread).
 
-For calculating the order, the parallel pollard rho algorithm is used on a GPU. This is discussed at the bottom of this file.
+For calculating the order, the parallel pollard rho algorithm is used on a GPU. This is discussed at the bottom of this file. I didn't use the better algorithms because I didn't know about them until it was too late to implement them.
 
 Some methods for increasing the speed of both implementations are discussed.
 
